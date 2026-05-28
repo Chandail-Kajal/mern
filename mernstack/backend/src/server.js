@@ -7,80 +7,113 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 import { connectDB } from "./config/db.js";
-import authRoutes from "./routes/authRoutes.js";
-import userRoutes from "./routes/userRoutes.js";
-import postRoutes from "./routes/postRoutes.js";
+import authRoutes    from "./routes/authRoutes.js";
+import userRoutes    from "./routes/userRoutes.js";
+import postRoutes    from "./routes/postRoutes.js";
 import messageRoutes from "./routes/messageRoutes.js";
+import callRoutes    from "./routes/callRoutes.js";
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname  = path.dirname(__filename);
 
-const app = express();
+const app        = express();
 const httpServer = createServer(app);
 
 const io = new Server(httpServer, {
-  cors: {
-    origin: "http://localhost:5173",
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: "http://localhost:5173", methods: ["GET", "POST", "PATCH"] },
 });
 
-// Connect DB
 connectDB();
 
-// Middleware
+// ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors({ origin: "http://localhost:5173", credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+
+// Serve ALL upload sub-folders: /uploads/images, /uploads/files, /uploads/audio, /uploads/videos, /uploads/stickers
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-// Routes
-app.use("/api/auth", authRoutes);
-app.use("/api/users", userRoutes);
-app.use("/api/posts", postRoutes);
+// ── REST Routes ───────────────────────────────────────────────────────────────
+app.use("/api/auth",     authRoutes);
+app.use("/api/users",    userRoutes);
+app.use("/api/posts",    postRoutes);
 app.use("/api/messages", messageRoutes);
+app.use("/api/calls",    callRoutes);
+app.get ("/api/health",  (_, res) => res.json({ status: "ok" }));
 
-// Health check
-app.get("/api/health", (req, res) => res.json({ status: "ok" }));
-
-// Socket.IO - Real-time chat
-// Keep track of which user ID is connected to which socket ID
+// ── Socket.IO ─────────────────────────────────────────────────────────────────
+// Maps  userId → socketId  for routing events
 const onlineUsers = new Map();
 
 io.on("connection", (socket) => {
-  console.log("✨ A user connected via WebSocket:", socket.id);
-
-  // 1. Listen for user coming online
+  // ── presence ────────────────────────────────────────────────────────────────
   socket.on("user:online", (userId) => {
     onlineUsers.set(userId, socket.id);
-    console.log(`👤 User ${userId} is now online with socket ${socket.id}`);
+    io.emit("user:status", { userId, online: true });
   });
 
-  // 2. Listen for a live message sent from the frontend
+  // ── chat messages ────────────────────────────────────────────────────────────
   socket.on("message:send", (data) => {
-    const { sender, receiver, text } = data;
-    
-    // Find the socket ID of the person receiving the message
-    const receiverSocketId = onlineUsers.get(receiver);
-
+    const receiverSocketId = onlineUsers.get(data.receiver);
     if (receiverSocketId) {
-      // Send the message directly to the receiver's screen instantly!
-      io.to(receiverSocketId).emit("message:receive", {
-        sender,
-        receiver,
-        text,
-        createdAt: new Date()
-      });
+      io.to(receiverSocketId).emit("message:receive", data);
+    }
+  });
+  socket.on("message:edit", ({ messageId, receiver, newText }) => {
+    socket.to(receiver).emit("message:receive", {
+      action: "edit",
+      messageId,
+      newText
+    });
+  });
+
+  socket.on("message:delete-everyone", ({ messageId, receiver }) => {
+    socket.to(receiver).emit("message:receive", {
+      action: "delete-everyone",
+      messageId
+    });
+  });
+
+  // ── WebRTC signalling  (call:offer → call:answer → call:ice-candidate) ───────
+  // All three events forward a payload from one peer to the other.
+
+  socket.on("call:offer", ({ to, from, offer, callType, callId, callerName, callerAvatar }) => {
+    const toSocket = onlineUsers.get(to);
+    if (toSocket) {
+      io.to(toSocket).emit("call:incoming", { from, offer, callType, callId, callerName, callerAvatar });
+    } else {
+      // target offline → immediately mark missed
+      socket.emit("call:missed", { callId });
     }
   });
 
-  // Handle user disconnecting
+  socket.on("call:answer", ({ to, answer, callId }) => {
+    const toSocket = onlineUsers.get(to);
+    if (toSocket) io.to(toSocket).emit("call:answered", { answer, callId });
+  });
+
+  socket.on("call:ice-candidate", ({ to, candidate }) => {
+    const toSocket = onlineUsers.get(to);
+    if (toSocket) io.to(toSocket).emit("call:ice-candidate", { candidate });
+  });
+
+  socket.on("call:reject", ({ to, callId }) => {
+    const toSocket = onlineUsers.get(to);
+    if (toSocket) io.to(toSocket).emit("call:rejected", { callId });
+  });
+
+  socket.on("call:end", ({ to, callId }) => {
+    const toSocket = onlineUsers.get(to);
+    if (toSocket) io.to(toSocket).emit("call:ended", { callId });
+  });
+
+  // ── disconnect ───────────────────────────────────────────────────────────────
   socket.on("disconnect", () => {
-    for (let [userId, socketId] of onlineUsers.entries()) {
-      if (socketId === socket.id) {
+    for (const [userId, sid] of onlineUsers.entries()) {
+      if (sid === socket.id) {
         onlineUsers.delete(userId);
-        console.log(`👋 User ${userId} went offline`);
+        io.emit("user:status", { userId, online: false });
         break;
       }
     }
@@ -88,6 +121,4 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 5000;
-httpServer.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-});
+httpServer.listen(PORT, () => console.log(`🚀 Server on http://localhost:${PORT}`));
